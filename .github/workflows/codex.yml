@@ -1,98 +1,61 @@
 name: Codex
 
 # ============================================================================
-# WHAT THIS DOES
-# ----------------------------------------------------------------------------
-# Starts a long-lived (~340 min) session on a fresh Ubuntu GitHub-hosted
-# runner, installs the latest Codex CLI, serves it through codex-web
-# (https://github.com/0xcaff/codex-web), and tunnels it to the public
-# internet with ngrok. A second ngrok tunnel exposes a "filebrowser" web
-# file manager rooted at your home directory, so you can read/edit the
-# Codex config and anything else on the runner from a browser (codex-web
-# itself has no file explorer).
+# Long-lived Codex session on a GitHub-hosted runner, served through
+# codex-web (https://github.com/0xcaff/codex-web) and tunneled with ngrok.
+# A second tunnel exposes "filebrowser" so you can read/edit the runner's
+# filesystem (including ~/.codex config) from a browser, since codex-web
+# has no file explorer of its own.
 #
-# Everything under $PERSIST_DIR (Codex home/config, npm/pip/cargo/go
-# caches, the checked-out repo, and anything else Codex writes there) is
-# restored at the start of the run and saved back at the end, so repeated
-# runs get faster and nothing you asked to keep is lost between sessions.
-#
-# SAFETY / SECURITY NOTES (read before using)
+# PERSISTENCE, KEPT SIMPLE ON PURPOSE
 # ----------------------------------------------------------------------------
-# 1. No auth is set up on the tunnels (by request). Anyone who gets the
-#    ngrok URL can run arbitrary commands as the runner user via Codex, and
-#    read/write/delete files via the file browser. Treat the URLs as
-#    secrets -- don't paste them anywhere public. ngrok assigns a random
-#    URL each run, which is your only real protection here; for anything
-#    more sensitive, add auth back (ngrok supports --basic-auth) or an
-#    IP restriction on your ngrok dashboard.
-# 2. This workflow is meant to be started manually (workflow_dispatch) by
-#    you, for your own use. Don't wire it to run on pushes/PRs from
-#    strangers.
-# 3. GitHub-hosted runners hard-cap a job at 360 minutes no matter what
-#    timeout you set. This workflow budgets 340 minutes of interactive
-#    session time and reserves the rest for a *graceful, non-rushed*
-#    shutdown and save -- see "PERSISTENCE / SAVE STRATEGY" below.
+# Everything under $HOME (/home/runner) is cached as one blob and restored
+# at the start of every run -- Codex's own config/sessions, npm/pip/cargo/go
+# caches and anything they installed, and the checked-out repo (so files
+# like project.c survive). No per-tool redirection: whatever a tool's
+# default install/cache location is, it's already under $HOME, so it's
+# already covered. The only thing excluded is /home/runner/work, which is
+# the runner's own scratch space (temp files, tool-cache, action code) --
+# not anything you or Codex created.
+#
+# SAVE STRATEGY (bounded loss even on a random cancel/crash)
+# ----------------------------------------------------------------------------
+# - Every ~7 min, a background loop rebuilds a checkpoint tarball on disk.
+# - Every ~4th checkpoint (~28 min) that tarball is also uploaded as a
+#   short-retention artifact, in case the runner's disk itself is lost.
+# - At the 340-min mark, the session stops on purpose and a full, unhurried
+#   final save runs with the remaining ~15-20 min budget (Actions Cache +
+#   a full-retention artifact). This is the reliable path.
+# - If the job is cancelled/crashes before that, GitHub still runs
+#   `if: always()` steps for up to ~5 min before hard-killing the job; a
+#   final step uploads whatever checkpoint is already sitting on disk
+#   (fast, since it's pre-built) as an emergency backup. It's a no-op if
+#   the normal path already finished.
+#
+# DISK-SPACE WATCHDOG
+# ----------------------------------------------------------------------------
+# Upstream Codex has known issues (openai/codex #24948, #41806, #33735,
+# #35458, #34061) where ~/.codex/sessions/**/rollout-*.jsonl can grow to
+# tens-hundreds of GB during long sessions, because compaction re-embeds
+# the full prior history (incl. screenshots) into a new line each time.
+# This workflow prunes oversized/stale rollout files on every checkpoint
+# tick and watches free disk space, escalating cleanup if it gets low.
 #
 # REQUIRED REPOSITORY SECRETS
 # ----------------------------------------------------------------------------
-#   NGROK_AUTHTOKEN   - from https://dashboard.ngrok.com/get-started/your-authtoken
-#   OPENAI_API_KEY     - optional. If unset, the workflow instead expects a
-#                        previously-cached ~/.codex/auth.json (see the
-#                        "Authenticate Codex" step) from an earlier
-#                        `codex login` you seeded once, e.g. by uploading it
-#                        as a run artifact and unpacking it into the persist
-#                        cache on the first run.
+#   NGROK_AUTHTOKEN  - from https://dashboard.ngrok.com/get-started/your-authtoken
+#   OPENAI_API_KEY   - optional; without it, a cached ~/.codex/auth.json
+#                      from a previous login is required instead.
 #
-# PERSISTENCE / SAVE STRATEGY (what happens if this run dies mid-way)
-# ----------------------------------------------------------------------------
-# Layer 1 - On-disk checkpoint: a background loop rebuilds a compressed
-#           tarball of $PERSIST_DIR on disk every ~7 minutes (configurable).
-#           Worst case uncontrolled loss: ~7 minutes of work.
-# Layer 2 - Off-box snapshot: every ~4th checkpoint (~28 min) that tarball
-#           is also uploaded as a short-retention run artifact, so you don't
-#           lose everything even if the runner's disk itself is unrecoverable.
-#           Best-effort; failures here never fail the job.
-# Layer 3 - Graceful stop (primary path): at the 340-minute mark the
-#           interactive session is stopped on purpose, services are shut
-#           down cleanly, a *full, unhurried* final checkpoint is built, and
-#           it's saved to both Actions Cache (for fast restore next run) and
-#           a full-retention artifact (for you to download directly). This
-#           runs with the ~15-20 minute buffer, not the 5-minute cancellation
-#           window, so it is the reliable path.
-# Layer 4 - Emergency fallback: if the job is cancelled or crashes *before*
-#           Layer 3 gets to run, GitHub still runs `if: always()` steps for
-#           up to ~5 minutes before hard-killing the job. A final always()
-#           step uploads whatever Layer 1 checkpoint already exists on disk
-#           (it's pre-built, so this is just an upload -- fast) and attempts
-#           a cache save. It's a no-op if Layer 3 already completed.
-#
-# Honest limit: nothing can save data *instantly* the moment a cancel is
-# clicked -- GitHub gives a running step ~10 seconds to react and only 5
-# minutes total to every remaining always() step combined, which is not
-# enough time to tar+upload many GB from scratch. That's why Layer 1 keeps
-# a ready-to-upload checkpoint warm on disk at all times instead of trying
-# to build one from nothing during the cancellation window.
-#
-# KNOWN CODEX DISK-SPACE FOOTGUN (researched via openai/codex issue tracker)
-# ----------------------------------------------------------------------------
-# Multiple open/recent upstream issues (openai/codex #24948, #41806, #33735,
-# #35458, #34061, #31478) describe ~/.codex/sessions/**/rollout-*.jsonl
-# growing to tens or hundreds of GB during long sessions: each context
-# compaction re-embeds the *entire* prior history (including base64
-# screenshots) into a new JSONL line, so size grows roughly quadratically
-# with session length, and old rollouts are never pruned automatically.
-# There's also a slower-growing ~/.codex/logs_2.sqlite trace log (#31478).
-# This workflow proactively prunes large/old rollout files on every
-# checkpoint tick and watches free disk space, escalating cleanup (and, if
-# truly critical, forcing an early graceful stop) rather than letting the
-# runner run out of disk mid-session.
+# No auth on the tunnels -- that's intentional, by request. Anyone with the
+# URL can use Codex and the file browser, so don't post the URL publicly.
 # ============================================================================
 
 on:
   workflow_dispatch:
     inputs:
       session_minutes:
-        description: "Interactive session length in minutes (keep well under 355; default leaves ~15-20 min to save)"
+        description: "Interactive session length in minutes (keep under 355)"
         default: "340"
         required: false
       checkpoint_interval_minutes:
@@ -100,7 +63,7 @@ on:
         default: "7"
         required: false
       enable_offbox_snapshots:
-        description: "Also upload periodic short-retention checkpoint artifacts (extra insurance, small overhead)"
+        description: "Also upload periodic short-retention checkpoint artifacts"
         type: boolean
         default: true
       offbox_snapshot_every_n_checkpoints:
@@ -128,16 +91,7 @@ permissions:
   contents: read
 
 env:
-  PERSIST_DIR: /home/runner/persist
-  CHECKPOINT_DIR: /home/runner/checkpoint
-  CODEX_HOME: /home/runner/persist/codex-home
-  NPM_CONFIG_CACHE: /home/runner/persist/caches/npm
-  NPM_CONFIG_PREFIX: /home/runner/persist/npm-global
-  PIP_CACHE_DIR: /home/runner/persist/caches/pip
-  XDG_CACHE_HOME: /home/runner/persist/caches/xdg
-  CARGO_HOME: /home/runner/persist/caches/cargo
-  GOPATH: /home/runner/persist/caches/go
-  GOMODCACHE: /home/runner/persist/caches/go/pkg/mod
+  CHECKPOINT_DIR: /tmp/codex-checkpoint
   SESSION_MINUTES: ${{ inputs.session_minutes || '340' }}
   CHECKPOINT_INTERVAL_MINUTES: ${{ inputs.checkpoint_interval_minutes || '7' }}
   OFFBOX_EVERY_N: ${{ inputs.offbox_snapshot_every_n_checkpoints || '4' }}
@@ -148,37 +102,19 @@ env:
 jobs:
   codex-session:
     runs-on: ubuntu-latest
-    # Hard cap on GitHub-hosted runners is 360 min regardless of this value.
-    # We stop the interactive part at SESSION_MINUTES (default 340) and keep
-    # this a little under the hard cap so our own graceful-stop steps run as
-    # NORMAL steps (full time budget) instead of racing the 5-min
-    # cancellation window.
     timeout-minutes: 355
 
     steps:
-      # ---------------------------------------------------------------
-      # 0. Fail fast if required secrets are missing
-      # ---------------------------------------------------------------
       - name: Verify required secrets are configured
         run: |
-          missing=()
-          [ -z "${{ secrets.NGROK_AUTHTOKEN }}" ] && missing+=("NGROK_AUTHTOKEN")
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::error::Missing required repository secrets: ${missing[*]}. Add them under Settings -> Secrets and variables -> Actions."
+          if [ -z "${{ secrets.NGROK_AUTHTOKEN }}" ]; then
+            echo "::error::Missing required repository secret: NGROK_AUTHTOKEN. Add it under Settings -> Secrets and variables -> Actions."
             exit 1
           fi
           if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
             echo "::warning::OPENAI_API_KEY is not set. The workflow will rely on a previously-cached ~/.codex/auth.json instead. If this is the first ever run, Codex login will fail."
           fi
 
-      # ---------------------------------------------------------------
-      # 1. Free up runner disk space BEFORE doing anything else.
-      #    jlumbroso/free-disk-space reliably reclaims ~20-30GB by
-      #    removing Android/.NET/Haskell/large preinstalled packages,
-      #    unused Docker images, and swap. tool-cache is left alone
-      #    since we set up Node ourselves right after and don't want to
-      #    fight the hosted tool cache.
-      # ---------------------------------------------------------------
       - name: Free disk space (remove unneeded preinstalled tooling)
         if: ${{ inputs.skip_disk_cleanup != true }}
         uses: jlumbroso/free-disk-space@main
@@ -201,44 +137,38 @@ jobs:
           df -h / >> "$GITHUB_STEP_SUMMARY"
           df -h /
 
-      # ---------------------------------------------------------------
-      # 2. Checkout the repo INTO the persist dir, so anything Codex
-      #    writes to the working tree (e.g. project.c) is automatically
-      #    covered by the checkpoint/cache mechanism below.
-      # ---------------------------------------------------------------
-      - name: Prepare persistent directories
+      - name: Prepare working directories
         run: |
-          mkdir -p "$PERSIST_DIR" "$CHECKPOINT_DIR" \
-                   "$CODEX_HOME" "$NPM_CONFIG_CACHE" "$NPM_CONFIG_PREFIX" \
-                   "$PIP_CACHE_DIR" "$XDG_CACHE_HOME" "$CARGO_HOME" "$GOPATH" \
-                   "$PERSIST_DIR/workspace" "$PERSIST_DIR/logs" "$PERSIST_DIR/bin"
-          echo "$NPM_CONFIG_PREFIX/bin" >> "$GITHUB_PATH"
-          echo "$PERSIST_DIR/bin" >> "$GITHUB_PATH"
+          mkdir -p "$CHECKPOINT_DIR/pids" "$HOME/bin" "$HOME/logs"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
+      # Checked out OUTSIDE /home/runner/work on purpose, so it's covered by
+      # the whole-$HOME cache below without having to special-case it.
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          path: persist/workspace
+          path: /home/runner/repo
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      # ---------------------------------------------------------------
-      # 3. Restore everything persistent from the previous run.
-      #    actions/cache entries are immutable per key, so we save with
-      #    a run-id-unique key and restore via a prefix (restore-keys),
-      #    which always resolves to the most recent matching entry.
-      # ---------------------------------------------------------------
-      - name: Restore persistent state cache (Codex home, tool caches, workspace)
-        id: cache_restore
+      # actions/cache entries are immutable per key, so we save with a
+      # run-id-unique key and restore via a prefix (restore-keys), which
+      # always resolves to the most recent matching entry. Everything under
+      # $HOME is one blob -- Codex config/sessions, npm/pip/cargo/go caches,
+      # anything installed, the repo -- except /home/runner/work, which is
+      # the runner's own scratch space, not user data.
+      - name: Restore persistent state cache (whole $HOME)
         uses: actions/cache/restore@v4
         with:
-          path: ${{ env.PERSIST_DIR }}
-          key: codex-persist-${{ github.run_id }}
+          path: |
+            /home/runner
+            !/home/runner/work
+          key: codex-home-${{ github.run_id }}
           restore-keys: |
-            codex-persist-
+            codex-home-
 
       - name: Restore apt package archive cache
         uses: actions/cache/restore@v4
@@ -253,9 +183,9 @@ jobs:
           # System packages (apt) can't truly "stay installed" between runs --
           # each run is a fresh VM. What we CAN persist is the .deb download,
           # so reinstalling is a local, offline, few-second operation instead
-          # of a slow download+install. We track what you added last time in
-          # $PERSIST_DIR/apt-manifest.txt (written at shutdown, see below).
-          manifest="$PERSIST_DIR/apt-manifest.txt"
+          # of a slow download+install. We track what was added last time in
+          # $HOME/apt-manifest.txt, written at shutdown below.
+          manifest="$HOME/apt-manifest.txt"
           if [ -s "$manifest" ]; then
             echo "Reinstalling previously-added apt packages from cached archives:"
             cat "$manifest"
@@ -266,9 +196,6 @@ jobs:
           fi
           apt list --installed 2>/dev/null | awk -F/ '{print $1}' | sort > "$RUNNER_TEMP/apt-baseline.txt"
 
-      # ---------------------------------------------------------------
-      # 4. Shared helper library, sourced by every later shell step.
-      # ---------------------------------------------------------------
       - name: Write shared session library
         run: |
           cat > "$RUNNER_TEMP/lib.sh" <<'LIBEOF'
@@ -280,11 +207,8 @@ jobs:
             # rollout-*.jsonl files can grow unbounded (observed: tens to
             # hundreds of GB) because compaction re-embeds full history
             # (including inline screenshots) on every compaction event.
-            local sess="$CODEX_HOME/sessions"
+            local sess="$HOME/.codex/sessions"
             [ -d "$sess" ] || return 0
-            # Drop anything over 150MB and older than 30 minutes -- generous
-            # enough to keep your current/recent sessions resumable, but
-            # stops runaway files from eating the whole disk.
             find "$sess" -type f -name '*.jsonl' -mmin +30 -size +150M -print -delete 2>/dev/null | while read -r f; do
               log "pruned oversized rollout file: $f"
             done
@@ -295,11 +219,11 @@ jobs:
             avail_mb=$(df -Pm / | awk 'NR==2{print $4}')
             if [ "$avail_mb" -lt 1024 ]; then
               log "CRITICAL: only ${avail_mb}MB free. Forcing aggressive session prune + early stop."
-              find "$CODEX_HOME/sessions" -type f -name '*.jsonl' -mmin +5 -delete 2>/dev/null || true
+              find "$HOME/.codex/sessions" -type f -name '*.jsonl' -mmin +5 -delete 2>/dev/null || true
               touch "$CHECKPOINT_DIR/CRITICAL_DISK"
             elif [ "$avail_mb" -lt 3072 ]; then
               log "WARNING: low disk space (${avail_mb}MB free). Pruning sessions harder."
-              find "$CODEX_HOME/sessions" -type f -name '*.jsonl' -mmin +10 -size +50M -delete 2>/dev/null || true
+              find "$HOME/.codex/sessions" -type f -name '*.jsonl' -mmin +10 -size +50M -delete 2>/dev/null || true
             fi
           }
 
@@ -308,8 +232,8 @@ jobs:
             local level="${1:-1}"
             local tmp="$CHECKPOINT_DIR/checkpoint.tar.zst.tmp"
             local final="$CHECKPOINT_DIR/checkpoint.tar.zst"
-            if tar --use-compress-program="zstd -T0 -${level}" \
-                   -cf "$tmp" -C "$(dirname "$PERSIST_DIR")" "$(basename "$PERSIST_DIR")" \
+            if tar --exclude="./work" --use-compress-program="zstd -T0 -${level}" \
+                   -cf "$tmp" -C "$HOME" . \
                    2>>"$CHECKPOINT_DIR/checkpoint.log"; then
               mv -f "$tmp" "$final"
               log "checkpoint built: $(du -h "$final" | cut -f1)"
@@ -348,12 +272,11 @@ jobs:
               local name; name=$(basename "$pf" .pid)
               local pid; pid=$(cat "$pf")
               if ! kill -0 "$pid" 2>/dev/null; then
-                log "WARNING: process '$name' (pid $pid) is no longer running. Check $PERSIST_DIR/logs/$name.log"
+                log "WARNING: process '$name' (pid $pid) is no longer running. Check $HOME/logs/$name.log"
               fi
             done
           }
           LIBEOF
-          mkdir -p "$CHECKPOINT_DIR/pids"
           echo "Library written to $RUNNER_TEMP/lib.sh"
 
       - name: Install off-box snapshot uploader (best-effort artifact helper)
@@ -384,12 +307,6 @@ jobs:
           })();
           JSEOF
 
-      # ---------------------------------------------------------------
-      # 5. Install ngrok, Codex CLI (latest), codex-web deps, filebrowser.
-      #    All installs land in caches under $PERSIST_DIR, so repeat runs
-      #    are much faster even though we always re-run `npm install` to
-      #    guarantee "latest".
-      # ---------------------------------------------------------------
       - name: Install ngrok
         run: |
           curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
@@ -407,41 +324,35 @@ jobs:
 
       - name: Install filebrowser (web file explorer for the runner)
         run: |
-          if [ ! -x "$PERSIST_DIR/bin/filebrowser" ]; then
+          if [ ! -x "$HOME/bin/filebrowser" ]; then
             curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | bash
-            cp "$(command -v filebrowser)" "$PERSIST_DIR/bin/filebrowser"
+            cp "$(command -v filebrowser)" "$HOME/bin/filebrowser"
           fi
-          "$PERSIST_DIR/bin/filebrowser" version
+          "$HOME/bin/filebrowser" version
 
-      # ---------------------------------------------------------------
-      # 6. Authenticate Codex (API key preferred for CI; falls back to
-      #    a restored auth.json from a prior interactive login).
-      # ---------------------------------------------------------------
       - name: Authenticate Codex
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          if [ -n "${{ secrets.OPENAI_API_KEY }}" ]; then
-            codex login --api-key "${{ secrets.OPENAI_API_KEY }}"
-          elif [ -f "$CODEX_HOME/auth.json" ]; then
+          if [ -n "$OPENAI_API_KEY" ]; then
+            printenv OPENAI_API_KEY | codex login --with-api-key
+          elif [ -f "$HOME/.codex/auth.json" ]; then
             echo "Using restored auth.json from the persistent cache."
           else
-            echo "::error::No OPENAI_API_KEY secret and no cached $CODEX_HOME/auth.json. Set the secret, or seed auth.json once (see header comment)."
+            echo "::error::No OPENAI_API_KEY secret and no cached ~/.codex/auth.json. Set the secret, or seed auth.json once (see header comment)."
             exit 1
           fi
 
-      # ---------------------------------------------------------------
-      # 7. Start filebrowser, codex-web, and two ngrok tunnels (each
-      #    protected with HTTP Basic Auth), all in the background.
-      # ---------------------------------------------------------------
       - name: Start filebrowser (rooted at the runner home directory)
         run: |
           source "$RUNNER_TEMP/lib.sh"
-          FB_DB="$PERSIST_DIR/filebrowser.db"
+          FB_DB="$HOME/filebrowser.db"
           if [ ! -f "$FB_DB" ]; then
-            "$PERSIST_DIR/bin/filebrowser" -d "$FB_DB" config init
-            "$PERSIST_DIR/bin/filebrowser" -d "$FB_DB" config set --auth.method=noauth
+            "$HOME/bin/filebrowser" -d "$FB_DB" config init
+            "$HOME/bin/filebrowser" -d "$FB_DB" config set --auth.method=noauth
           fi
-          nohup "$PERSIST_DIR/bin/filebrowser" -d "$FB_DB" -r /home/runner -a 127.0.0.1 -p 8081 \
-            > "$PERSIST_DIR/logs/filebrowser.log" 2>&1 &
+          nohup "$HOME/bin/filebrowser" -d "$FB_DB" -r /home/runner -a 127.0.0.1 -p 8081 \
+            > "$HOME/logs/filebrowser.log" 2>&1 &
           echo $! > "$CHECKPOINT_DIR/pids/filebrowser.pid"
           log "filebrowser started (pid $(cat "$CHECKPOINT_DIR/pids/filebrowser.pid"))"
 
@@ -450,52 +361,45 @@ jobs:
           source "$RUNNER_TEMP/lib.sh"
           export CODEX_CLI_PATH="$(command -v codex)"
           nohup npx --yes github:0xcaff/codex-web \
-            > "$PERSIST_DIR/logs/codex-web.log" 2>&1 &
+            > "$HOME/logs/codex-web.log" 2>&1 &
           echo $! > "$CHECKPOINT_DIR/pids/codex-web.pid"
           log "codex-web started (pid $(cat "$CHECKPOINT_DIR/pids/codex-web.pid"))"
-          # give it a moment to bind before we point ngrok at it
           for _ in $(seq 1 30); do
             curl -fsS http://127.0.0.1:8214 >/dev/null 2>&1 && break
             sleep 1
           done
 
-      - name: Start ngrok tunnels (Basic Auth protected)
+      - name: Start ngrok tunnels
         run: |
           source "$RUNNER_TEMP/lib.sh"
           nohup ngrok http 8214 \
             --web-addr=127.0.0.1:4040 --log=stdout --log-format=json \
-            > "$PERSIST_DIR/logs/ngrok-codex.log" 2>&1 &
+            > "$HOME/logs/ngrok-codex.log" 2>&1 &
           echo $! > "$CHECKPOINT_DIR/pids/ngrok-codex.pid"
 
           nohup ngrok http 8081 \
             --web-addr=127.0.0.1:4041 --log=stdout --log-format=json \
-            > "$PERSIST_DIR/logs/ngrok-files.log" 2>&1 &
+            > "$HOME/logs/ngrok-files.log" 2>&1 &
           echo $! > "$CHECKPOINT_DIR/pids/ngrok-files.pid"
 
-          wait_for_ngrok_url 4040 "$RUNNER_TEMP/codex_url.txt" || { echo "::error::ngrok tunnel for codex-web never came up"; cat "$PERSIST_DIR/logs/ngrok-codex.log"; exit 1; }
-          wait_for_ngrok_url 4041 "$RUNNER_TEMP/files_url.txt" || { echo "::error::ngrok tunnel for filebrowser never came up"; cat "$PERSIST_DIR/logs/ngrok-files.log"; exit 1; }
+          wait_for_ngrok_url 4040 "$RUNNER_TEMP/codex_url.txt" || { echo "::error::ngrok tunnel for codex-web never came up"; cat "$HOME/logs/ngrok-codex.log"; exit 1; }
+          wait_for_ngrok_url 4041 "$RUNNER_TEMP/files_url.txt" || { echo "::error::ngrok tunnel for filebrowser never came up"; cat "$HOME/logs/ngrok-files.log"; exit 1; }
 
           CODEX_URL=$(cat "$RUNNER_TEMP/codex_url.txt")
           FILES_URL=$(cat "$RUNNER_TEMP/files_url.txt")
           echo "::notice title=Codex Web URL::${CODEX_URL}"
           echo "::notice title=File Browser URL::${FILES_URL}"
           {
-            echo "## 🚀 Your Codex session is live"
+            echo "## Your Codex session is live"
             echo ""
             echo "| Service | URL |"
             echo "|---|---|"
             echo "| Codex Web | ${CODEX_URL} |"
             echo "| File Browser | ${FILES_URL} |"
             echo ""
-            echo "⚠️ No auth on these links -- treat them as secrets, don't share the URL."
-            echo ""
             echo "Session budget: **${SESSION_MINUTES} minutes**, then automatic graceful shutdown + save."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---------------------------------------------------------------
-      # 8. Main interactive window: keep everything alive, checkpoint
-      #    on a schedule, watch disk space, until the time budget is up.
-      # ---------------------------------------------------------------
       - name: Interactive session (checkpointing every few minutes)
         run: |
           source "$RUNNER_TEMP/lib.sh"
@@ -535,11 +439,6 @@ jobs:
 
           log "Session time budget reached (or ended early). Proceeding to graceful shutdown."
 
-      # ---------------------------------------------------------------
-      # 9. Graceful shutdown + full, unhurried final save (primary
-      #    persistence path -- runs with the full remaining time budget,
-      #    not the 5-minute cancellation window).
-      # ---------------------------------------------------------------
       - name: Stop services and build final checkpoint
         if: always()
         run: |
@@ -558,24 +457,24 @@ jobs:
 
           prune_codex_sessions
 
-          # Record any apt packages added this session so next run's
-          # "reinstall from cache" step can bring gcc/etc back quickly.
           apt list --installed 2>/dev/null | awk -F/ '{print $1}' | sort > "$RUNNER_TEMP/apt-final.txt"
-          comm -13 "$RUNNER_TEMP/apt-baseline.txt" "$RUNNER_TEMP/apt-final.txt" > "$PERSIST_DIR/apt-manifest.txt" || true
+          comm -13 "$RUNNER_TEMP/apt-baseline.txt" "$RUNNER_TEMP/apt-final.txt" > "$HOME/apt-manifest.txt" || true
 
           build_checkpoint 9   # higher compression, we're not in a hurry here
           touch "$CHECKPOINT_DIR/GRACEFUL_STOP_DONE"
 
           echo "### Final disk usage" >> "$GITHUB_STEP_SUMMARY"
-          du -sh "$PERSIST_DIR"/* 2>/dev/null | sort -rh >> "$GITHUB_STEP_SUMMARY" || true
+          du -sh "$HOME"/* 2>/dev/null | sort -rh >> "$GITHUB_STEP_SUMMARY" || true
           df -h / >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save persistent state cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: ${{ env.PERSIST_DIR }}
-          key: codex-persist-${{ github.run_id }}
+          path: |
+            /home/runner
+            !/home/runner/work
+          key: codex-home-${{ github.run_id }}
 
       - name: Save apt package archive cache
         if: always()
@@ -593,30 +492,26 @@ jobs:
           retention-days: ${{ fromJSON(env.ARTIFACT_RETENTION_DAYS) }}
           if-no-files-found: warn
 
-      # ---------------------------------------------------------------
-      # 10. Emergency fallback -- only does real work if the graceful
-      #     path above never got to run (e.g. the job was cancelled or
-      #     crashed earlier). Uploads whatever on-disk checkpoint already
-      #     exists; it's pre-built so this is just an upload, fast enough
-      #     to fit GitHub's ~5-minute always() window on cancellation.
-      # ---------------------------------------------------------------
-      - name: Emergency fallback save (only runs if graceful save was interrupted)
+      - name: Check whether emergency save is needed
         if: always()
+        id: emergency_check
         run: |
           if [ -f "$CHECKPOINT_DIR/GRACEFUL_STOP_DONE" ]; then
             echo "Graceful shutdown already completed and saved everything. Nothing to do."
+            echo "checkpoint_exists=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "::warning::Graceful shutdown did not complete (job was likely cancelled or crashed). Running emergency save of the most recent checkpoint."
           echo "checkpoint_exists=$( [ -f "$CHECKPOINT_DIR/checkpoint.tar.zst" ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
-        id: emergency_check
 
       - name: Emergency cache save
         if: ${{ always() && steps.emergency_check.outputs.checkpoint_exists == 'true' }}
         uses: actions/cache/save@v4
         with:
-          path: ${{ env.PERSIST_DIR }}
-          key: codex-persist-emergency-${{ github.run_id }}
+          path: |
+            /home/runner
+            !/home/runner/work
+          key: codex-home-emergency-${{ github.run_id }}
 
       - name: Emergency artifact upload
         if: ${{ always() && steps.emergency_check.outputs.checkpoint_exists == 'true' }}
