@@ -268,10 +268,12 @@ jobs:
           }
 
           wait_for_ngrok_url() {
-            local api="$1" varfile="$2" tries=40
+            # Single agent, single local API (127.0.0.1:4040) serving both
+            # tunnels -- filter by the tunnel's name from ngrok.yml.
+            local name="$1" varfile="$2" tries=40
             for _ in $(seq 1 "$tries"); do
-              url=$(curl -fsS "http://127.0.0.1:${api}/api/tunnels" 2>/dev/null | \
-                    node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);console.log((j.tunnels&&j.tunnels[0]&&j.tunnels[0].public_url)||"")}catch(e){}})')
+              url=$(curl -fsS "http://127.0.0.1:4040/api/tunnels" 2>/dev/null | \
+                    node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);const t=(j.tunnels||[]).find(t=>t.name===process.argv[1]);console.log(t?t.public_url:"")}catch(e){}})' "$name")
               if [ -n "$url" ]; then
                 echo "$url" > "$varfile"
                 return 0
@@ -330,7 +332,6 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/ngrok.list
           sudo apt-get update -y
           sudo apt-get install -y ngrok zstd
-          ngrok config add-authtoken "${{ secrets.NGROK_AUTHTOKEN }}"
 
       - name: Install/update latest Codex CLI
         run: |
@@ -387,18 +388,27 @@ jobs:
       - name: Start ngrok tunnels
         run: |
           source "$RUNNER_TEMP/lib.sh"
-          nohup ngrok http 8214 \
-            --web-addr=127.0.0.1:4040 --log=stdout --log-format=json \
-            > "$HOME/logs/ngrok-codex.log" 2>&1 &
-          echo $! > "$CHECKPOINT_DIR/pids/ngrok-codex.pid"
+          # Written to $RUNNER_TEMP, not $HOME -- $HOME gets cached/uploaded,
+          # and this file has to contain the raw authtoken.
+          cat > "$RUNNER_TEMP/ngrok.yml" <<'NGROKEOF'
+          version: "2"
+          authtoken: ${{ secrets.NGROK_AUTHTOKEN }}
+          tunnels:
+            codex:
+              proto: http
+              addr: 8214
+            files:
+              proto: http
+              addr: 8081
+          NGROKEOF
 
-          nohup ngrok http 8081 \
-            --web-addr=127.0.0.1:4041 --log=stdout --log-format=json \
-            > "$HOME/logs/ngrok-files.log" 2>&1 &
-          echo $! > "$CHECKPOINT_DIR/pids/ngrok-files.pid"
+          nohup ngrok start --all --config "$RUNNER_TEMP/ngrok.yml" \
+            --log=stdout --log-format=json \
+            > "$HOME/logs/ngrok.log" 2>&1 &
+          echo $! > "$CHECKPOINT_DIR/pids/ngrok.pid"
 
-          wait_for_ngrok_url 4040 "$RUNNER_TEMP/codex_url.txt" || { echo "::error::ngrok tunnel for codex-web never came up"; cat "$HOME/logs/ngrok-codex.log"; exit 1; }
-          wait_for_ngrok_url 4041 "$RUNNER_TEMP/files_url.txt" || { echo "::error::ngrok tunnel for filebrowser never came up"; cat "$HOME/logs/ngrok-files.log"; exit 1; }
+          wait_for_ngrok_url "codex" "$RUNNER_TEMP/codex_url.txt" || { echo "::error::ngrok tunnel for codex-web never came up"; cat "$HOME/logs/ngrok.log"; exit 1; }
+          wait_for_ngrok_url "files" "$RUNNER_TEMP/files_url.txt" || { echo "::error::ngrok tunnel for filebrowser never came up"; cat "$HOME/logs/ngrok.log"; exit 1; }
 
           CODEX_URL=$(cat "$RUNNER_TEMP/codex_url.txt")
           FILES_URL=$(cat "$RUNNER_TEMP/files_url.txt")
