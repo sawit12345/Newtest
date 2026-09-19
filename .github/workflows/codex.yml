@@ -142,12 +142,14 @@ jobs:
           mkdir -p "$CHECKPOINT_DIR/pids" "$HOME/bin" "$HOME/logs"
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
-      # Checked out OUTSIDE /home/runner/work on purpose, so it's covered by
-      # the whole-$HOME cache below without having to special-case it.
+      # actions/checkout refuses a path outside the default workspace, so the
+      # repo lands at the normal /home/runner/work/<owner>/<repo> location.
+      # That's still under $HOME, so it's still covered by the whole-$HOME
+      # cache below -- we just exclude the runner's own internal scratch
+      # folders (_temp, _tool, _actions, ...) that live alongside it, since
+      # those are regenerated fresh every run and aren't your data.
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          path: /home/runner/repo
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -158,22 +160,32 @@ jobs:
       # run-id-unique key and restore via a prefix (restore-keys), which
       # always resolves to the most recent matching entry. Everything under
       # $HOME is one blob -- Codex config/sessions, npm/pip/cargo/go caches,
-      # anything installed, the repo -- except /home/runner/work, which is
-      # the runner's own scratch space, not user data.
+      # anything installed, the checked-out repo -- except the runner's own
+      # internal work subfolders, which aren't user data.
       - name: Restore persistent state cache (whole $HOME)
         uses: actions/cache/restore@v4
         with:
           path: |
             /home/runner
-            !/home/runner/work
+            !/home/runner/work/_temp
+            !/home/runner/work/_tool
+            !/home/runner/work/_actions
+            !/home/runner/work/_actionsMetadata
+            !/home/runner/work/_PipelineMapping
           key: codex-home-${{ github.run_id }}
           restore-keys: |
             codex-home-
 
+      # /var/cache/apt/archives/partial is root-only (mode 700) and not
+      # world-readable, which makes the cache action's tar step fail with
+      # a permission error -- exclude it, it's just in-progress downloads
+      # and is empty once apt-get finishes anyway.
       - name: Restore apt package archive cache
         uses: actions/cache/restore@v4
         with:
-          path: /var/cache/apt/archives
+          path: |
+            /var/cache/apt/archives
+            !/var/cache/apt/archives/partial
           key: apt-archives-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             apt-archives-${{ runner.os }}-
@@ -232,7 +244,10 @@ jobs:
             local level="${1:-1}"
             local tmp="$CHECKPOINT_DIR/checkpoint.tar.zst.tmp"
             local final="$CHECKPOINT_DIR/checkpoint.tar.zst"
-            if tar --exclude="./work" --use-compress-program="zstd -T0 -${level}" \
+            if tar --exclude="./work/_temp" --exclude="./work/_tool" \
+                   --exclude="./work/_actions" --exclude="./work/_actionsMetadata" \
+                   --exclude="./work/_PipelineMapping" \
+                   --use-compress-program="zstd -T0 -${level}" \
                    -cf "$tmp" -C "$HOME" . \
                    2>>"$CHECKPOINT_DIR/checkpoint.log"; then
               mv -f "$tmp" "$final"
@@ -442,6 +457,10 @@ jobs:
       - name: Stop services and build final checkpoint
         if: always()
         run: |
+          if [ ! -f "$RUNNER_TEMP/lib.sh" ]; then
+            echo "::warning::Session library was never written -- an earlier step must have failed before this session started. Nothing was running, so there's nothing to check-point."
+            exit 0
+          fi
           source "$RUNNER_TEMP/lib.sh"
           for pf in "$CHECKPOINT_DIR"/pids/*.pid; do
             [ -f "$pf" ] || continue
@@ -473,14 +492,20 @@ jobs:
         with:
           path: |
             /home/runner
-            !/home/runner/work
+            !/home/runner/work/_temp
+            !/home/runner/work/_tool
+            !/home/runner/work/_actions
+            !/home/runner/work/_actionsMetadata
+            !/home/runner/work/_PipelineMapping
           key: codex-home-${{ github.run_id }}
 
       - name: Save apt package archive cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: /var/cache/apt/archives
+          path: |
+            /var/cache/apt/archives
+            !/var/cache/apt/archives/partial
           key: apt-archives-${{ runner.os }}-${{ github.run_id }}
 
       - name: Upload final session backup artifact
@@ -510,7 +535,11 @@ jobs:
         with:
           path: |
             /home/runner
-            !/home/runner/work
+            !/home/runner/work/_temp
+            !/home/runner/work/_tool
+            !/home/runner/work/_actions
+            !/home/runner/work/_actionsMetadata
+            !/home/runner/work/_PipelineMapping
           key: codex-home-emergency-${{ github.run_id }}
 
       - name: Emergency artifact upload
